@@ -31,6 +31,7 @@ extern crate generic_array;
 #[macro_use]
 extern crate nb;
 
+use core::convert::TryInto;
 use core::mem;
 
 use generic_array::typenum::consts::*;
@@ -71,6 +72,10 @@ pub enum Error<E> {
     Timeout,
     /// ???
     Wr,
+    /// The requested PICC was not found
+    NotFound,
+    /// The UID returned by the PICC was in an invalid format
+    UidFormat,
 }
 
 /// MFRC522 driver
@@ -148,64 +153,92 @@ where
 
     /// Sends a REQuest type A to nearby PICCs
     pub fn reqa<'b>(&mut self) -> Result<AtqA, Error<E>> {
-        // NOTE REQA is a short frame (7 bits)
-        self.transceive(&[picc::REQA], 7)
+        self.transceive_bit_oriented(&[picc::REQA], 7, 0)
             .map(|bytes| AtqA { bytes })
     }
 
     /// Selects an idle PICC
-    ///
-    /// NOTE currently this only supports single size UIDs
     // TODO anticollision loop
-    // TODO add optional UID to select an specific PICC
-    pub fn select(&mut self, _atqa: &AtqA) -> Result<Uid, Error<E>> {
-        let rx = self.transceive::<U5>(&[picc::SEL_CL1, 0x20], 0)?;
+    pub fn select(&mut self, atqa: &AtqA) -> Result<PiccInfo, Error<E>> {
+        let _ = atqa;
 
-        assert_ne!(
-            rx[0],
-            picc::CT,
-            "double and triple size UIDs are currently not supported"
-        );
+        let mut bytes = [0u8; 10];
+        let mut index = 0;
 
-        let expected_bcc = rx[4];
-        let computed_bcc = rx[0] ^ rx[1] ^ rx[2] ^ rx[3];
+        for &cl in &[picc::SEL_CL1, picc::SEL_CL2, picc::SEL_CL3] {
+            let rx = self.transceive_bit_oriented::<U5>(&[cl, 0x20], 0, 0)?;
 
-        // XXX can this ever fail? (buggy PICC?)
-        if computed_bcc != expected_bcc {
-            return Err(Error::Bcc);
+            let uid_part: [u8; 4] = rx[..4].try_into().unwrap();
+
+            let rx_bcc = rx[4];
+            if calculate_bcc(&uid_part) != rx_bcc {
+                return Err(Error::Bcc);
+            }
+
+            let sak = self.select_cl(cl, uid_part)?;
+
+            if sak.complete {
+                bytes[index..index+4].copy_from_slice(&uid_part);
+                index += 4;
+
+                return Ok(PiccInfo {
+                    uid: Uid::try_new(&bytes[..index]).unwrap(),
+                    compliant: sak.compliant,
+                })
+            } else {
+                bytes[index..index+3].copy_from_slice(&uid_part[1..]);
+                index += 3;
+            }
         }
 
+        Err(Error::UidFormat)
+    }
+
+    /// Select an idle PICC with the provided UID
+    pub fn select_uid(&mut self, atqa: &AtqA, uid: Uid) -> Result<PiccInfo, Error<E>> {
+        let _ = atqa;
+
+        let bytes = uid.bytes();
+        let mut index = 0;
+
+        for &cl in &[picc::SEL_CL1, picc::SEL_CL2, picc::SEL_CL3] {
+            let mut uid_part: [u8; 4] = unsafe { mem::uninitialized() };
+            if bytes.len() - index == 4 {
+                uid_part.copy_from_slice(&bytes[index..]);
+                index += 4;
+            } else {
+                uid_part[0] = picc::CT;
+                uid_part[1..].copy_from_slice(&bytes[index..index+3]);
+                index += 3;
+            }
+
+            let sak = self.select_cl(cl, uid_part)?;
+
+            if index == bytes.len() {
+                if !sak.complete {
+                    return Err(Error::NotFound);
+                }
+
+                return Ok(PiccInfo {
+                    uid,
+                    compliant: sak.compliant,
+                });
+            }
+        }
+
+        Err(Error::NotFound)
+    }
+
+    fn select_cl(&mut self, cl: u8, uid_part: [u8; 4]) -> Result<Sak, Error<E>> {
         let mut tx: [u8; 9] = unsafe { mem::uninitialized() };
-        tx[0] = picc::SEL_CL1;
+        tx[0] = cl;
         tx[1] = 0x70;
-        tx[2..7].copy_from_slice(&rx);
+        tx[2..6].copy_from_slice(&uid_part);
+        tx[6] = calculate_bcc(&uid_part);
 
-        let crc = self.calculate_crc(&tx[..7])?;
-        tx[7..].copy_from_slice(&crc);
+        let rx = self.transceive::<U3>(&mut tx)?;
 
-        // enable automatic CRC validation during reception
-        let rx2 = self.transceive::<U3>(&tx, 0)?;
-
-        let crc2 = self.calculate_crc(&rx2[..1])?;
-
-        if &rx2[1..] != &crc2 {
-            return Err(Error::Crc);
-        }
-
-        let sak = rx2[0];
-
-        let compliant = match (sak & (1 << 2) != 0, sak & (1 << 5) != 0) {
-            // indicates that the UID is incomplete -- this is unreachable because we only support
-            // single size UIDs
-            (_, true) => unreachable!(),
-            (true, false) => true,
-            (false, false) => false,
-        };
-
-        Ok(Uid {
-            bytes: [rx[0], rx[1], rx[2], rx[3]],
-            compliant,
-        })
+        Ok(Sak::new(rx[0]))
     }
 
     /// Returns the version of the MFRC522
@@ -285,10 +318,56 @@ where
         self.iface.write(Register::FifoLevel, 1 << 7)
     }
 
+    /// Sends a request to the PICC and returns the response. This method automatically calculates
+    /// and adds the CRC to the last two bytes of tx_buffer, so you must reserve two bytes of space
+    /// for it. The respone CRC is automatically verified.
+    ///
+    /// # Arguments
+    ///
+    /// tx_buffer:    Bytes to send to PICC. Must contain two additional bytes of space at the end
+    ///               for the CRC.
     fn transceive<RX>(
+        &mut self,
+        tx_buffer: &mut [u8],
+    ) -> Result<GenericArray<u8, RX>, Error<E>>
+    where
+        RX: ArrayLength<u8>,
+    {
+        let tx_crc_index = tx_buffer.len() - 2;
+
+        let tx_crc = self.calculate_crc(&tx_buffer[..tx_crc_index])?;
+        tx_buffer[tx_crc_index..].copy_from_slice(&tx_crc);
+
+        let rx = self.transceive_bit_oriented::<RX>(tx_buffer, 0, 0)?;
+
+        if rx.len() < 3 {
+            return Err(Error::IncompleteFrame);
+        }
+
+        let rx_crc_index = rx.len() - 2;
+
+        let computed_rx_crc = self.calculate_crc(&rx[..rx_crc_index])?;
+        if &rx[rx_crc_index..] != &computed_rx_crc {
+            return Err(Error::Crc);
+        }
+
+        Ok(rx)
+    }
+
+    /// Sends a request to the PICC and returns the response. Allows bit-oriented frames.
+    ///
+    /// # Arguments
+    ///
+    /// tx_buffer:    bytes to send to PICC
+    /// tx_last_bits: number of valid bits in the last byte of tx_buffer for bit-oriented frames
+    ///               0 = not bit-oriented frame
+    /// rx_align:     bit position to place first bit of received bit-oriented frame
+    ///               0 = not bit-oriented frame
+    fn transceive_bit_oriented<RX>(
         &mut self,
         tx_buffer: &[u8],
         tx_last_bits: u8,
+        rx_align: u8,
     ) -> Result<GenericArray<u8, RX>, Error<E>>
     where
         RX: ArrayLength<u8>,
@@ -309,9 +388,10 @@ where
         // signal command
         self.command(Command::Transceive).map_err(Error::Interface)?;
 
+        let bit_framing = (1 << 7) | ((rx_align & 0x7) << 4) | (tx_last_bits & 0x7);
+
         // configure short frame and start transmission
-        self.iface.write(Register::BitFraming, (1 << 7) | tx_last_bits)
-            .map_err(Error::Interface)?;
+        self.iface.write(Register::BitFraming, bit_framing).map_err(Error::Interface)?;
 
         // TODO timeout when connection to the MFRC522 is lost (?)
         // wait for transmission + reception to complete
@@ -326,11 +406,10 @@ where
             }
         }
 
-        // XXX do we need a guard here?
         // check for any outstanding error
-        // if irq & ERR_IRQ != 0 {
-        self.check_error_register()?;
-        // }
+        if irq & ERR_IRQ != 0 {
+            self.check_error_register()?;
+        }
 
         // grab RX data
         let mut rx_buffer: GenericArray<u8, RX> = unsafe { mem::uninitialized() };
@@ -417,21 +496,80 @@ pub struct AtqA {
     bytes: GenericArray<u8, U2>,
 }
 
-/// Single size UID
+/// Information about a scanned PICC
 #[derive(Debug)]
-pub struct Uid {
-    bytes: [u8; 4],
+pub struct PiccInfo {
+    uid: Uid,
     compliant: bool,
 }
 
-impl Uid {
-    /// The bytes of the UID
-    pub fn bytes(&self) -> &[u8; 4] {
-        &self.bytes
+impl PiccInfo {
+    fn new(uid: Uid, compliant: bool) -> Self {
+        Self { uid, compliant }
+    }
+
+    /// Gets the tag UID
+    pub fn uid(&self) -> &Uid {
+        &self.uid
     }
 
     /// Is the PICC compliant with ISO/IEC 14443-4?
     pub fn is_compliant(&self) -> bool {
         self.compliant
     }
+}
+
+/// PICC UID
+#[derive(Copy, Clone)]
+pub struct Uid {
+    bytes: [u8; 10],
+    len: u8,
+}
+
+impl Uid {
+    /// Creates a new Uid with the provided bytes. The length of bytes must be 4, 7 or 10.
+    pub fn try_new(bytes: &[u8]) -> Result<Uid, ()> {
+        match bytes.len() {
+            4 | 7 | 10 => {
+                Ok(Self {
+                    bytes: {
+                        let mut b: [u8; 10] = unsafe { mem::uninitialized() };
+                        b[..bytes.len()].copy_from_slice(bytes);
+                        b
+                    },
+                    len: bytes.len() as u8,
+                })
+            },
+            _ => Err(()),
+        }
+    }
+
+    /// The bytes of the UID
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
+impl core::fmt::Debug for Uid {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> Result<(), core::fmt::Error> {
+        write!(f, "{:02x?}", self.bytes())
+    }
+}
+
+struct Sak {
+    pub complete: bool,
+    pub compliant: bool,
+}
+
+impl Sak {
+    fn new(sak: u8) -> Self {
+        Self {
+            complete: sak & (1 << 2) == 0,
+            compliant: sak & (1 << 5) == 0,
+        }
+    }
+}
+
+fn calculate_bcc(bytes: &[u8; 4]) -> u8 {
+    return bytes[0] ^ bytes[1] ^ bytes[2] ^ bytes[3];
 }
